@@ -4,7 +4,18 @@ from typing import List, Dict, Any, Tuple, Optional
 import pandas as pd
 from datetime import datetime
 
+from conclusion_engine import (
+    CONCLUSION_COLUMNS,
+    ConclusionConfig,
+    build_conclusion_columns,
+    guess_business_columns,
+)
+
 SUPPORTED_IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".jfif", ".tif", ".tiff"}
+
+# 默认结论口径：同商户/同地址 7 天内视为同一作业周期，不算跨期复用
+DEFAULT_CONCLUSION_CONFIG = ConclusionConfig()
+
 
 class PhotoIndex:
     """照片文件快速索引器"""
@@ -32,7 +43,7 @@ class PhotoIndex:
             return None
         photo_str = str(photo_str).strip()
         
-        # 1. 绝对路径且真实存在
+        # 1. 结对路径且真实存在
         if os.path.isabs(photo_str) and os.path.exists(photo_str):
             return photo_str
 
@@ -78,6 +89,21 @@ def collect_images_from_dir(folder_path: str) -> List[Dict[str, Any]]:
                     "path": full_p
                 })
     return items
+
+
+def _clean_row_dict(row: Any) -> Dict[str, Any]:
+    """把一行原始业务数据转成纯字典，供结论引擎读商户/地址/完成时间/哈希距离。"""
+    try:
+        d = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+    except Exception:
+        return {}
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        try:
+            out[str(k).strip()] = None if pd.isna(v) else v
+        except Exception:
+            out[str(k).strip()] = v
+    return out
 
 
 class ExcelTaskParser:
@@ -199,7 +225,9 @@ class ExcelTaskParser:
                     "photo_b": val_p_b,
                     "path_b": path_b,
                     "is_ready": is_ready,
-                    "raw_index": idx
+                    "raw_index": idx,
+                    # 结论体系需要的业务上下文（商户、地址、完成时间、pHash/ORB）
+                    "row_dict": _clean_row_dict(row)
                 })
         else:
             group_col = guessed["group_id"]
@@ -232,7 +260,9 @@ class ExcelTaskParser:
                                 "photo_b": val_p_b,
                                 "path_b": path_b,
                                 "is_ready": bool(path_a and path_b),
-                                "raw_index": None
+                                "raw_index": None,
+                                # 同组两行合并：第一行为主，第二行用 __2 后缀补充
+                                "row_dict": _merge_group_rows(r1, r2)
                             })
             else:
                 for i in range(0, len(self.df) - 1, 2):
@@ -256,75 +286,119 @@ class ExcelTaskParser:
                         "photo_b": val_p_b,
                         "path_b": path_b,
                         "is_ready": bool(path_a and path_b),
-                        "raw_index": i
+                        "raw_index": i,
+                        "row_dict": _merge_group_rows(_clean_row_dict(r1), _clean_row_dict(r2))
                     })
 
         return pairs
 
 
-def export_results_to_excel(results: List[Dict[str, Any]], output_path: str):
-    """导出相同照片多维证据链抽检结果至独立 Excel 报告"""
+def _merge_group_rows(r1: Dict[str, Any], r2: Dict[str, Any]) -> Dict[str, Any]:
+    """把“一行一张照”的两行拼成“一行一对”，便于结论引擎识别 1/2 后缀列。"""
+    merged: Dict[str, Any] = {}
+    for k, v in (r1 or {}).items():
+        merged[f"{str(k).strip()}1"] = v
+    for k, v in (r2 or {}).items():
+        merged[f"{str(k).strip()}2"] = v
+    return merged
+
+
+def _conclusion_for_result(r: Dict[str, Any], config: Optional[ConclusionConfig] = None) -> Dict[str, Any]:
+    """基于一条抽检结果生成结论体系列。
+
+    关键设计：问题类型由业务字段（商户/地址/完成时间）归类，
+    结论等级由“确定性算法 + AI 建议”共同定级，AI 不单独给“确认”。
+    """
+    row = r.get("row_dict") or {}
+    if not isinstance(row, dict):
+        row = {}
+    # 若原表缺字段，至少把任务号补上，保证“同任务”能被排除
+    row = dict(row)
+    row.setdefault("task_no_1", r.get("task_a", ""))
+    row.setdefault("task_no_2", r.get("task_b", ""))
+
+    ai = None
+    if r.get("verdict") or r.get("is_same_photo") is not None or r.get("is_same") is not None:
+        ai = r
+    return build_conclusion_columns(
+        row,
+        ai=ai,
+        mapping=guess_business_columns(list(row.keys())),
+        config=config or DEFAULT_CONCLUSION_CONFIG,
+    )
+
+
+def export_results_to_excel(results: List[Dict[str, Any]], output_path: str, config: Optional[ConclusionConfig] = None):
+    """导出相同照片多维证据链抽检结果（含结论体系）至独立 Excel 报告"""
     data = []
+    conclusions = []
     for r in results:
-        is_same = r.get("is_same_photo", r.get("is_same", False))
-        data.append({
+        c = _conclusion_for_result(r, config)
+        conclusions.append(c)
+        row = {
             "抽检序号": r.get("id"),
             "分组/组号": r.get("group", ""),
             "任务A编号": r.get("task_a", ""),
             "任务B编号": r.get("task_b", ""),
-            "AI定性结论": r.get("verdict", "未定性"),
-            "AI判定是否同一照片": "是 (相同底片)" if is_same else "否 (不同底片)",
-            "图1店招文字": r.get("signboard_text_1", "无店招"),
-            "图2店招文字": r.get("signboard_text_2", "无店招"),
-            "店招比对结论": r.get("signboard_match", "无店招不适用"),
-            "物理场景重合度": f"{r.get('scene_similarity', 0.0):.2f}",
-            "AI置信度": f"{r.get('confidence', 0.0):.2f}",
-            "多维证据详细依据": r.get("reason", ""),
+        }
+        # 结论体系列放在前面，方便直接阅读
+        for col in CONCLUSION_COLUMNS:
+            row[col] = c.get(col, "")
+        row.update({
             "照片A名称": r.get("photo_a", ""),
             "照片A路径": r.get("path_a", ""),
             "照片B名称": r.get("photo_b", ""),
             "照片B路径": r.get("path_b", ""),
-            "核验时间": r.get("check_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            "照片A指纹(sha1)": r.get("photo_sha1_a", ""),
+            "照片B指纹(sha1)": r.get("photo_sha1_b", ""),
+            "重复调用一致性": r.get("consistency", "未抽测"),
+            "核验时间": r.get("check_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         })
+        data.append(row)
 
     df_out = pd.DataFrame(data)
-    total = len(results)
-    same_count = sum(1 for r in results if r.get("is_same_photo", r.get("is_same", False)))
-    diff_count = total - same_count
-    accuracy_rate = (same_count / total * 100) if total > 0 else 0
 
-    summary_data = [
-        {"指标": "抽检总对数", "数值": total},
-        {"指标": "AI判定为同一照片 (违规复用)", "数值": same_count},
-        {"指标": "AI判定为不同照片 (重拍/误判)", "数值": diff_count},
-        {"指标": "重复违规吻合率", "数值": f"{accuracy_rate:.1f}%"},
-        {"指标": "报告生成时间", "数值": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    total = len(results)
+    summary_rows = [
+        {"维度": "总体", "取值": "抽检总对数", "数量": total},
     ]
-    df_summary = pd.DataFrame(summary_data)
+    for key in ("问题类型", "结论等级"):
+        counter: Dict[str, int] = {}
+        for c in conclusions:
+            v = str(c.get(key, "")) or "(空)"
+            counter[v] = counter.get(v, 0) + 1
+        for v, n in sorted(counter.items(), key=lambda x: -x[1]):
+            summary_rows.append({"维度": key, "取值": v, "数量": n})
+
+    ok_calls = sum(1 for r in results if not r.get("error"))
+    summary_rows.extend([
+        {"维度": "调用质量", "取值": "正常返回对数", "数量": ok_calls},
+        {"维度": "调用质量", "取值": "异常/不合规对数", "数量": total - ok_calls},
+        {"维度": "说明", "取值": "结论不等于处罚，须在「人工终审结论」列完成终审", "数量": ""},
+        {"维度": "说明", "取值": "报告生成时间", "数量": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+    ])
+    df_summary = pd.DataFrame(summary_rows)
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        df_summary.to_excel(writer, sheet_name="抽检统计概览", index=False)
+        df_summary.to_excel(writer, sheet_name="结论概览", index=False)
         df_out.to_excel(writer, sheet_name="抽检详细记录", index=False)
 
 
-def export_annotated_original_excel_p1(original_excel_path: str, results: List[Dict[str, Any]], output_path: str) -> str:
-    """在原始 Excel 文件副本中追加完整的多维证据链与店招 AI 抽检结果列"""
+def export_annotated_original_excel_p1(original_excel_path: str, results: List[Dict[str, Any]], output_path: str, config: Optional[ConclusionConfig] = None) -> str:
+    """在原始 Excel 副本中追加结论体系列（问题类型 / 结论等级 / 人工终审 / 审计字段）"""
     if not os.path.exists(original_excel_path):
         raise FileNotFoundError(f"原 Excel 文件不存在: {original_excel_path}")
 
     df = pd.read_excel(original_excel_path)
+    df.columns = [str(c).strip() for c in df.columns]
 
-    # 初始化新列
-    df["AI抽检状态"] = "未抽检"
-    df["AI定性结论"] = ""
-    df["AI是否同一照片"] = ""
-    df["图1店招文字"] = ""
-    df["图2店招文字"] = ""
-    df["店招比对结论"] = ""
-    df["物理场景重合度"] = ""
-    df["AI置信度"] = ""
-    df["多维证据详细依据"] = ""
-    df["AI核验时间"] = ""
+    # 避免重复追加：先清掉同名旧列
+    df = df.drop(columns=[c for c in CONCLUSION_COLUMNS if c in df.columns], errors="ignore")
+    for col in CONCLUSION_COLUMNS:
+        df[col] = ""
+
+    mapping = guess_business_columns(list(df.columns))
+    cfg = config or DEFAULT_CONCLUSION_CONFIG
 
     results_by_idx = {}
     for r in results:
@@ -332,21 +406,26 @@ def export_annotated_original_excel_p1(original_excel_path: str, results: List[D
         if idx is not None and 0 <= idx < len(df):
             results_by_idx[idx] = r
 
+    # 1) 已抽检行：带 AI 建议定级
     for idx, r in results_by_idx.items():
-        df.loc[idx, "AI抽检状态"] = "已抽检"
-        df.loc[idx, "AI定性结论"] = r.get("verdict", "")
-        is_same = r.get("is_same_photo", r.get("is_same", False))
-        df.loc[idx, "AI是否同一照片"] = "是 (同一底片)" if is_same else "否 (不同底片)"
-        df.loc[idx, "图1店招文字"] = r.get("signboard_text_1", "无店招")
-        df.loc[idx, "图2店招文字"] = r.get("signboard_text_2", "无店招")
-        df.loc[idx, "店招比对结论"] = r.get("signboard_match", "无店招不适用")
-        df.loc[idx, "物理场景重合度"] = f"{r.get('scene_similarity', 0.0):.2f}"
-        df.loc[idx, "AI置信度"] = f"{r.get('confidence', 0.0):.2f}"
-        df.loc[idx, "多维证据详细依据"] = r.get("reason", "")
-        df.loc[idx, "AI核验时间"] = r.get("check_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        row_dict = df.loc[idx].to_dict()
+        ai = r if (r.get("verdict") or r.get("is_same_photo") is not None or r.get("is_same") is not None) else None
+        c = build_conclusion_columns(row_dict, ai=ai, mapping=mapping, config=cfg)
+        if not c.get("AI核验时间"):
+            c["AI核验时间"] = r.get("check_time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        for col in CONCLUSION_COLUMNS:
+            df.loc[idx, col] = c.get(col, "")
+
+    # 2) 未抽检行：仍由确定性算法与业务字段归类定级（可能直接得到“确认”或“正常”）
+    for idx in df.index:
+        if idx in results_by_idx:
+            continue
+        c = build_conclusion_columns(df.loc[idx].to_dict(), ai=None, mapping=mapping, config=cfg)
+        for col in CONCLUSION_COLUMNS:
+            df.loc[idx, col] = c.get(col, "")
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="数据明细(含AI多维质检)", index=False)
+        df.to_excel(writer, sheet_name="数据明细(含结论体系)", index=False)
 
     return output_path
 
@@ -360,11 +439,17 @@ def export_storefront_results_to_excel(results: List[Dict[str, Any]], output_pat
             "任务/标识号": r.get("task_id", ""),
             "照片名称": r.get("photo_name", ""),
             "照片完整路径": r.get("path", ""),
-            "是否真实门头": "真实门头照" if r.get("is_real_storefront") else "非真实门头/违规",
+            "是否真实门头(AI建议)": "真实门头照" if r.get("is_real_storefront") else "非真实门头/待核实",
             "风险/异常类型": r.get("risk_type", "未知"),
             "识别门头店名": r.get("store_name", ""),
-            "判定置信度": f"{r.get('confidence', 0.0):.2f}",
+            "AI置信度(仅参考)": f"{r.get('confidence', 0.0):.2f}",
             "AI详细核验原因": r.get("reason", ""),
+            "调用状态": r.get("call_status", ""),
+            "模型版本": r.get("model_version", ""),
+            "prompt版本": r.get("prompt_version", ""),
+            "人工终审结论": "",
+            "终审人": "",
+            "终审时间": "",
             "质检时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         })
 
@@ -376,9 +461,10 @@ def export_storefront_results_to_excel(results: List[Dict[str, Any]], output_pat
 
     summary_data = [
         {"指标": "质检照片总数", "数值": total},
-        {"指标": "真实门头合格数", "数值": real_count},
-        {"指标": "非真实/异常数", "数值": fake_count},
-        {"指标": "门头合规率", "数值": f"{real_rate:.1f}%"},
+        {"指标": "AI建议真实门头数", "数值": real_count},
+        {"指标": "AI建议待核实数", "数值": fake_count},
+        {"指标": "AI建议合规比例(非最终结论)", "数值": f"{real_rate:.1f}%"},
+        {"指标": "说明", "数值": "单图识别假阳性较高，结论须人工终审后生效"},
         {"指标": "报告生成时间", "数值": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     ]
     df_summary = pd.DataFrame(summary_data)
@@ -395,11 +481,17 @@ def export_annotated_original_excel_p2(original_excel_path: str, results: List[D
 
     df = pd.read_excel(original_excel_path)
     df["AI门头质检状态"] = "未质检"
-    df["AI是否真实门头"] = ""
+    df["AI建议是否真实门头"] = ""
     df["AI门头风险类型"] = ""
     df["AI识别店招名称"] = ""
-    df["AI置信度"] = ""
+    df["AI置信度(仅参考)"] = ""
     df["AI核验详细原因"] = ""
+    df["调用状态"] = ""
+    df["模型版本"] = ""
+    df["prompt版本"] = ""
+    df["人工终审结论"] = ""
+    df["终审人"] = ""
+    df["终审时间"] = ""
     df["AI质检时间"] = ""
 
     results_by_idx = {}
@@ -410,15 +502,17 @@ def export_annotated_original_excel_p2(original_excel_path: str, results: List[D
 
     for idx, r in results_by_idx.items():
         df.loc[idx, "AI门头质检状态"] = "已质检"
-        df.loc[idx, "AI是否真实门头"] = "真实门头照" if r.get("is_real_storefront") else "非真实门头/违规"
+        df.loc[idx, "AI建议是否真实门头"] = "真实门头照" if r.get("is_real_storefront") else "非真实门头/待核实"
         df.loc[idx, "AI门头风险类型"] = r.get("risk_type", "未知")
         df.loc[idx, "AI识别店招名称"] = r.get("store_name", "")
-        df.loc[idx, "AI置信度"] = f"{r.get('confidence', 0.0):.2f}"
+        df.loc[idx, "AI置信度(仅参考)"] = f"{r.get('confidence', 0.0):.2f}"
         df.loc[idx, "AI核验详细原因"] = r.get("reason", "")
+        df.loc[idx, "调用状态"] = r.get("call_status", "")
+        df.loc[idx, "模型版本"] = r.get("model_version", "")
+        df.loc[idx, "prompt版本"] = r.get("prompt_version", "")
         df.loc[idx, "AI质检时间"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="明细(含真实门头质检)", index=False)
 
     return output_path
-
