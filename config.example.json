@@ -1,0 +1,5 @@
+{
+  "api_url": "https://ark.cn-beijing.volces.com/api/plan/v3",
+  "model": "doubao-seed-2.0-lite",
+  "api_key": "your-volcengine-ark-api-key-here"
+}

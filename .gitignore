@@ -1,0 +1,62 @@
+# Python 缓存与中间文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+
+# 操作系统与编辑器临时文件
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 业务超大离线数据文件与照片归档 (数十万张图片与几十MB超大表格)
+pos-jianhang2_已合并_photos/
+重复检查/
+门头照片/
+*.csv
+pos-jianhang*.xlsx
+原始数据-*.xlsx
+绍兴相同照片*.xlsx
+*追加AI抽检结果副本*.xlsx
+1.xlsx
+.~*.xlsx
+.~*.csv
+
+# 保留轻量级示例文件
+!20组AI抽检评估报告.xlsx
+
+# 本地私密配置与密钥文件 (严禁推入版本库)
+config.local.json
+*.local.*
+.env
+.env.*
