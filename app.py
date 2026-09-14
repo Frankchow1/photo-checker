@@ -22,6 +22,12 @@ from sampling import (
     calculate_confidence_sample_size,
     stratified_sample
 )
+from concurrent_runner import (
+    ConcurrentRunner,
+    RunnerConfig,
+    DEFAULT_WORKERS,
+    suggest_workers
+)
 from data_processor import (
     PhotoIndex,
     ExcelTaskParser,
@@ -68,10 +74,12 @@ class PhotoCheckerApp(ctk.CTk):
         self.results_p2: List[Dict[str, Any]] = []
         self.single_test_img_path = ""
 
-        # 线程控制
+        # 线程与并发控制
         self.is_running = False
         self.stop_requested = False
         self.msg_queue = queue.Queue()
+        self.run_started_at: Optional[datetime] = None
+        self.runtime_stats = {"workers": DEFAULT_WORKERS, "retries": 0, "failed": 0, "throttled": 0}
 
         self._build_ui()
         self.after(100, self._process_queue)
@@ -146,6 +154,92 @@ class PhotoCheckerApp(ctk.CTk):
         self.lbl_api_status = ctk.CTkLabel(box, text="● 已预留", text_color="#10b981", font=("SF Pro", 11, "bold"))
         self.lbl_api_status.pack(side="left", padx=2)
 
+    # ================== 并发设置组件 ==================
+
+    def _build_concurrency_row(self, parent, prefix: str):
+        """并发与稳定性设置行（两个模式共用一套控件样式）。"""
+        row = ctk.CTkFrame(parent, corner_radius=8, fg_color="#0f172a")
+        row.pack(fill="x", padx=10, pady=3)
+
+        ctk.CTkLabel(row, text="⚡ 并发与稳定性:", font=("SF Pro", 12, "bold"), text_color="#f59e0b").pack(side="left", padx=(8, 6))
+
+        ctk.CTkLabel(row, text="并发数", font=("SF Pro", 11)).pack(side="left", padx=(4, 2))
+        combo_workers = ctk.CTkComboBox(
+            row,
+            values=["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "12", "16"],
+            width=70,
+            font=("SF Pro", 11)
+        )
+        combo_workers.set(str(DEFAULT_WORKERS))
+        combo_workers.pack(side="left", padx=2)
+
+        ctk.CTkLabel(row, text="最大重试", font=("SF Pro", 11)).pack(side="left", padx=(8, 2))
+        combo_retry = ctk.CTkComboBox(row, values=["0", "1", "2", "3", "4", "5"], width=60, font=("SF Pro", 11))
+        combo_retry.set("3")
+        combo_retry.pack(side="left", padx=2)
+
+        var_adaptive = tk.BooleanVar(value=True)
+        chk_adaptive = ctk.CTkCheckBox(
+            row,
+            text="遇限流自动降速",
+            variable=var_adaptive,
+            font=("SF Pro", 11),
+            text_color="#38bdf8"
+        )
+        chk_adaptive.pack(side="left", padx=8)
+
+        var_compensate = tk.BooleanVar(value=True)
+        chk_compensate = ctk.CTkCheckBox(
+            row,
+            text="结束后失败自动补偿重跑",
+            variable=var_compensate,
+            font=("SF Pro", 11),
+            text_color="#34d399"
+        )
+        chk_compensate.pack(side="left", padx=8)
+
+        lbl_runtime = ctk.CTkLabel(
+            row,
+            text="运行状态: 待命 | 当前并发 - | 重试 0 | 失败 0",
+            font=("SF Pro", 11),
+            text_color="#94a3b8"
+        )
+        lbl_runtime.pack(side="left", padx=10)
+
+        setattr(self, f"combo_workers_{prefix}", combo_workers)
+        setattr(self, f"combo_retry_{prefix}", combo_retry)
+        setattr(self, f"var_adaptive_{prefix}", var_adaptive)
+        setattr(self, f"var_compensate_{prefix}", var_compensate)
+        setattr(self, f"lbl_runtime_{prefix}", lbl_runtime)
+        return row
+
+    def _get_runner_config(self, prefix: str, total_items: int) -> RunnerConfig:
+        try:
+            workers = int(getattr(self, f"combo_workers_{prefix}").get().strip())
+        except Exception:
+            workers = DEFAULT_WORKERS
+        # 小批量没必要开大并发，自动收敛
+        workers = min(workers, max(1, suggest_workers(total_items)) if total_items <= 10 else workers)
+
+        try:
+            retries = int(getattr(self, f"combo_retry_{prefix}").get().strip())
+        except Exception:
+            retries = 3
+
+        return RunnerConfig(
+            workers=workers,
+            max_retries=retries,
+            adaptive=bool(getattr(self, f"var_adaptive_{prefix}").get()),
+            min_workers=2 if workers >= 2 else 1,
+            enable_compensation=bool(getattr(self, f"var_compensate_{prefix}").get()),
+            compensation_workers=max(1, min(2, workers)),
+        )
+
+    def _update_runtime_label(self, prefix: str, text: str, color: str = "#94a3b8"):
+        lbl = getattr(self, f"lbl_runtime_{prefix}", None)
+        if lbl is not None:
+            lbl.configure(text=text, text_color=color)
+
     def _build_panel_p1(self):
         self.frame_p1 = ctk.CTkFrame(self.panel_container, fg_color="transparent")
 
@@ -200,11 +294,11 @@ class PhotoCheckerApp(ctk.CTk):
         )
         self.chk_only_ready.pack(side="left", padx=8)
 
-        # 开关 2：物理遮蔽水印开关 (核心新功能)
+        # 开关 2：物理遮蔽水印开关 (现为自适应带高)
         self.var_mask_watermark = tk.BooleanVar(value=True)
         self.chk_mask_watermark = ctk.CTkCheckBox(
             row_params,
-            text="🛡️ 前置物理遮蔽水印(底部20%)",
+            text="🛡️ 前置物理遮蔽水印(自适应带高)",
             variable=self.var_mask_watermark,
             font=("SF Pro", 11, "bold"),
             text_color="#38bdf8"
@@ -226,6 +320,9 @@ class PhotoCheckerApp(ctk.CTk):
 
         self.lbl_stats_p1 = ctk.CTkLabel(row_params, text="总任务: 0 组 | 本地就绪: 0 对", text_color="#9ca3af", font=("SF Pro", 11))
         self.lbl_stats_p1.pack(side="left", padx=6)
+
+        # 并发与稳定性设置行
+        self._build_concurrency_row(self.frame_p1, "p1")
 
         # 模式一的前端提示词可视化卡片 (支持展开/折叠/实时编辑)
         self.frame_prompt_card_p1 = ctk.CTkFrame(self.frame_p1, corner_radius=8, fg_color="#1e293b")
@@ -269,6 +366,19 @@ class PhotoCheckerApp(ctk.CTk):
         )
         self.btn_export_p1.pack(side="right", padx=5)
 
+        self.btn_retry_failed_p1 = ctk.CTkButton(
+            row_btns,
+            text="🔁 重跑失败项",
+            fg_color="#f59e0b",
+            hover_color="#d97706",
+            width=110,
+            height=30,
+            font=("SF Pro", 12, "bold"),
+            state="disabled",
+            command=self._retry_failed_p1
+        )
+        self.btn_retry_failed_p1.pack(side="right", padx=5)
+
         self.btn_stop_p1 = ctk.CTkButton(
             row_btns,
             text="⏹ 停止",
@@ -300,7 +410,7 @@ class PhotoCheckerApp(ctk.CTk):
             self.btn_toggle_prompt_p1.configure(text="⚙️ 查看/调整AI多维提示词")
             self.show_prompt_p1 = False
         else:
-            self.frame_prompt_card_p1.pack(fill="x", padx=10, pady=3, after=self.frame_p1.winfo_children()[1])
+            self.frame_prompt_card_p1.pack(fill="x", padx=10, pady=3, after=self.frame_p1.winfo_children()[2])
             self.btn_toggle_prompt_p1.configure(text="▲ 收起提示词面板")
             self.show_prompt_p1 = True
 
@@ -343,6 +453,9 @@ class PhotoCheckerApp(ctk.CTk):
         self.entry_photos_p2 = ctk.CTkEntry(batch_bar, placeholder_text="选择包含待检门头照的文件夹 (自动扫描全部图片)")
         self.entry_photos_p2.grid(row=0, column=1, padx=5, pady=2, sticky="ew")
         ctk.CTkButton(batch_bar, text="选择目录", width=90, command=self._select_photos_p2).grid(row=0, column=2, padx=5, pady=2)
+
+        # 并发与稳定性设置行
+        self._build_concurrency_row(self.frame_p2, "p2")
 
         op_bar = ctk.CTkFrame(self.frame_p2, fg_color="transparent")
         op_bar.pack(fill="x", padx=10, pady=(3, 6))
@@ -397,37 +510,43 @@ class PhotoCheckerApp(ctk.CTk):
 
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
 
+        # 行状态颜色：失败/重试后成功一眼可辨
+        self.tree.tag_configure("row_failed", foreground="#ef4444")
+        self.tree.tag_configure("row_retried", foreground="#f59e0b")
+
     def _setup_tree_columns(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
 
         if self.current_mode == "相同照片比对核验":
             # 完整展示店招与多维业务定性字段
-            cols = ("id", "group", "task_a", "task_b", "verdict", "same_photo", "sign_1", "sign_2", "sign_match", "similarity")
+            cols = ("id", "group", "task_a", "task_b", "verdict", "same_photo", "sign_1", "sign_2", "sign_match", "similarity", "run_status")
             self.tree.configure(columns=cols)
             self.tree.heading("id", text="序号")
             self.tree.heading("group", text="组标识")
             self.tree.heading("task_a", text="任务A")
             self.tree.heading("task_b", text="任务B")
-            self.tree.heading("verdict", text="AI定性结论")
+            self.tree.heading("verdict", text="AI建议结论")
             self.tree.heading("same_photo", text="同一底片")
             self.tree.heading("sign_1", text="图1店招")
             self.tree.heading("sign_2", text="图2店招")
             self.tree.heading("sign_match", text="店招比对")
             self.tree.heading("similarity", text="场景重合")
+            self.tree.heading("run_status", text="执行状态")
 
             self.tree.column("id", width=40, anchor="center")
-            self.tree.column("group", width=65, anchor="center")
-            self.tree.column("task_a", width=90, anchor="w")
-            self.tree.column("task_b", width=90, anchor="w")
-            self.tree.column("verdict", width=120, anchor="center")
-            self.tree.column("same_photo", width=65, anchor="center")
-            self.tree.column("sign_1", width=110, anchor="w")
-            self.tree.column("sign_2", width=110, anchor="w")
-            self.tree.column("sign_match", width=75, anchor="center")
-            self.tree.column("similarity", width=60, anchor="center")
+            self.tree.column("group", width=60, anchor="center")
+            self.tree.column("task_a", width=85, anchor="w")
+            self.tree.column("task_b", width=85, anchor="w")
+            self.tree.column("verdict", width=115, anchor="center")
+            self.tree.column("same_photo", width=60, anchor="center")
+            self.tree.column("sign_1", width=100, anchor="w")
+            self.tree.column("sign_2", width=100, anchor="w")
+            self.tree.column("sign_match", width=70, anchor="center")
+            self.tree.column("similarity", width=58, anchor="center")
+            self.tree.column("run_status", width=90, anchor="center")
         else:
-            cols = ("id", "task_id", "photo_name", "is_real", "risk_type", "store_name", "confidence")
+            cols = ("id", "task_id", "photo_name", "is_real", "risk_type", "store_name", "confidence", "run_status")
             self.tree.configure(columns=cols)
             self.tree.heading("id", text="序号")
             self.tree.heading("task_id", text="任务ID")
@@ -436,14 +555,16 @@ class PhotoCheckerApp(ctk.CTk):
             self.tree.heading("risk_type", text="风险类型")
             self.tree.heading("store_name", text="识别店名")
             self.tree.heading("confidence", text="置信度")
+            self.tree.heading("run_status", text="执行状态")
 
             self.tree.column("id", width=45, anchor="center")
-            self.tree.column("task_id", width=90, anchor="w")
-            self.tree.column("photo_name", width=150, anchor="w")
-            self.tree.column("is_real", width=80, anchor="center")
-            self.tree.column("risk_type", width=90, anchor="center")
-            self.tree.column("store_name", width=110, anchor="w")
-            self.tree.column("confidence", width=65, anchor="center")
+            self.tree.column("task_id", width=85, anchor="w")
+            self.tree.column("photo_name", width=140, anchor="w")
+            self.tree.column("is_real", width=75, anchor="center")
+            self.tree.column("risk_type", width=85, anchor="center")
+            self.tree.column("store_name", width=100, anchor="w")
+            self.tree.column("confidence", width=60, anchor="center")
+            self.tree.column("run_status", width=90, anchor="center")
 
     def _build_right_viewer(self):
         right_box = ctk.CTkFrame(self.work_split, fg_color="transparent")
@@ -486,7 +607,7 @@ class PhotoCheckerApp(ctk.CTk):
         detail_box.grid_rowconfigure(2, weight=1)
         detail_box.grid_columnconfigure(0, weight=1)
 
-        self.lbl_verdict = ctk.CTkLabel(detail_box, text="AI 定性结论: 就绪", font=("SF Pro", 12, "bold"), text_color="#9ca3af", anchor="w")
+        self.lbl_verdict = ctk.CTkLabel(detail_box, text="AI 建议结论: 就绪", font=("SF Pro", 12, "bold"), text_color="#9ca3af", anchor="w")
         self.lbl_verdict.grid(row=0, column=0, sticky="w", pady=(1, 2))
 
         # 多维证据链指标标签条 (店招、场景重合度、机位透视)
@@ -507,16 +628,24 @@ class PhotoCheckerApp(ctk.CTk):
         self.current_preview_paths = (None, None)
 
     def _build_bottom_bar(self):
-        self.progress_bar = ctk.CTkProgressBar(self.bottom_frame, width=320)
+        self.progress_bar = ctk.CTkProgressBar(self.bottom_frame, width=300)
         self.progress_bar.pack(side="left", padx=15)
         self.progress_bar.set(0)
 
         self.lbl_progress = ctk.CTkLabel(self.bottom_frame, text="就绪", font=("SF Pro", 12))
         self.lbl_progress.pack(side="left", padx=5)
 
+        self.lbl_runner_state = ctk.CTkLabel(
+            self.bottom_frame,
+            text="并发: - | 重试: 0 | 失败: 0",
+            font=("SF Pro", 11),
+            text_color="#f59e0b"
+        )
+        self.lbl_runner_state.pack(side="left", padx=12)
+
         self.lbl_summary_stats = ctk.CTkLabel(
             self.bottom_frame,
-            text="抽检总数: 0 | 违规(同一照片): 0 | 正常/误判: 0",
+            text="抽检总数: 0 | 同一底片: 0 | 正常/误判: 0",
             font=("SF Pro", 12, "bold"),
             text_color="#60a5fa"
         )
@@ -542,7 +671,7 @@ class PhotoCheckerApp(ctk.CTk):
             self.lbl_table_title.configure(text="门头照质检抽检清单 (单图真实性质检)")
 
         self._setup_tree_columns()
-        self.lbl_verdict.configure(text="AI 定性结论: 模式已切换为 " + mode_name, text_color="#9ca3af")
+        self.lbl_verdict.configure(text="AI 建议结论: 模式已切换为 " + mode_name, text_color="#9ca3af")
         self.progress_bar.set(0)
         self.lbl_progress.configure(text="就绪")
 
@@ -649,6 +778,104 @@ class PhotoCheckerApp(ctk.CTk):
     def _on_sample_mode_change_p1(self, choice):
         self._update_sampling_p1()
 
+    def _compare_task_fn(self, client, prompt, do_mask):
+        """生成单对比对任务（供并发引擎调用，必须是线程安全的纯函数）。"""
+        def _task(pair: Dict[str, Any]) -> Dict[str, Any]:
+            pa, pb = pair.get("path_a"), pair.get("path_b")
+            if not pa or not pb:
+                return {
+                    "is_same_photo": None,
+                    "confidence": 0.0,
+                    "verdict": "【照片缺失】",
+                    "has_signboard": "未知",
+                    "signboard_text_1": "-",
+                    "signboard_text_2": "-",
+                    "signboard_match": "-",
+                    "scene_similarity": 0.0,
+                    "reason": f"未找到本地照片 (A: {pa or '缺'}, B: {pb or '缺'})",
+                    "call_status": "photo_missing",
+                    "error": True
+                }
+            return client.compare_images(
+                img_path_a=pa,
+                img_path_b=pb,
+                task_a=pair.get("task_a", ""),
+                task_b=pair.get("task_b", ""),
+                custom_prompt=prompt,
+                mask_watermark=do_mask,
+                mask_mode="adaptive",
+                use_cache=True
+            )
+        return _task
+
+    def _launch_run_p1(self, pairs: List[Dict[str, Any]], resume: bool = False):
+        """启动（或重跑）一批并发比对任务。"""
+        if not pairs:
+            messagebox.showinfo("提示", "没有需要执行的任务。")
+            return
+
+        if not resume:
+            self.results_p1 = []
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            for p in pairs:
+                self.tree.insert("", "end", iid=f"p1_{p['id']}", values=(
+                    p["id"], p.get("group", ""), p.get("task_a", ""), p.get("task_b", ""),
+                    "等待质检...", "-", "-", "-", "-", "-", "排队中"
+                ))
+        else:
+            # 重跑失败项：先把旧的失败记录从结果里移除
+            retry_ids = {p["id"] for p in pairs}
+            self.results_p1 = [r for r in self.results_p1 if r.get("id") not in retry_ids]
+            for p in pairs:
+                iid = f"p1_{p['id']}"
+                if self.tree.exists(iid):
+                    vals = list(self.tree.item(iid, "values"))
+                    vals[-1] = "重跑中"
+                    self.tree.item(iid, values=tuple(vals), tags=("row_retried",))
+
+        self.is_running = True
+        self.stop_requested = False
+        self.run_started_at = datetime.now()
+        self.btn_start_p1.configure(state="disabled")
+        self.btn_retry_failed_p1.configure(state="disabled")
+        self.btn_stop_p1.configure(state="normal")
+        self.progress_bar.set(0)
+
+        client = self._get_client()
+        prompt = self.txt_prompt_p1.get("1.0", "end").strip()
+        do_mask = self.var_mask_watermark.get()
+        cfg = self._get_runner_config("p1", len(pairs))
+        task_fn = self._compare_task_fn(client, prompt, do_mask)
+
+        self.runtime_stats = {"workers": cfg.workers, "retries": 0, "failed": 0, "throttled": 0}
+        self._update_runtime_label(
+            "p1", f"运行状态: 执行中 | 并发 {cfg.workers} | 重试 0 | 失败 0", "#f59e0b"
+        )
+
+        def _on_result(done, total, item, res, meta):
+            record = {
+                **item,
+                **(res or {}),
+                "check_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "重试次数": meta.get("retries", 0),
+                "执行阶段": meta.get("phase", "main"),
+            }
+            self.results_p1.append(record)
+            self.msg_queue.put(("item_p1_done", (done, total, record, meta)))
+
+        def _worker():
+            runner = ConcurrentRunner(
+                config=cfg,
+                on_result=_on_result,
+                on_event=lambda e: self.msg_queue.put(("runner_event", e)),
+                should_stop=lambda: self.stop_requested,
+            )
+            summary = runner.run(pairs, task_fn)
+            self.msg_queue.put(("all_p1_done", summary))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _start_checking_p1(self):
         if not self.all_pairs:
             messagebox.showwarning("提示", "请先选择相同照片任务 Excel！")
@@ -670,73 +897,19 @@ class PhotoCheckerApp(ctk.CTk):
             return
 
         self.sampled_pairs = stratified_sample(pool, min(sample_n, len(pool)))
-        self.results_p1 = []
+        self._launch_run_p1(self.sampled_pairs, resume=False)
 
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-
-        for p in self.sampled_pairs:
-            self.tree.insert("", "end", iid=f"p1_{p['id']}", values=(
-                p["id"],
-                p.get("group", ""),
-                p.get("task_a", ""),
-                p.get("task_b", ""),
-                "等待质检...",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-"
-            ))
-
-        self.is_running = True
-        self.stop_requested = False
-        self.btn_start_p1.configure(state="disabled")
-        self.btn_stop_p1.configure(state="normal")
-        self.progress_bar.set(0)
-
-        client = self._get_client()
-        prompt = self.txt_prompt_p1.get("1.0", "end").strip()
-        do_mask = self.var_mask_watermark.get()
-
-        def _worker():
-            total = len(self.sampled_pairs)
-            for idx, pair in enumerate(self.sampled_pairs):
-                if self.stop_requested:
-                    break
-
-                pa, pb = pair.get("path_a"), pair.get("path_b")
-                if not pa or not pb:
-                    res = {
-                        "is_same_photo": False,
-                        "confidence": 0.0,
-                        "verdict": "【照片缺失】",
-                        "has_signboard": "未知",
-                        "signboard_text_1": "-",
-                        "signboard_text_2": "-",
-                        "signboard_match": "-",
-                        "scene_similarity": 0.0,
-                        "reason": f"未找到本地照片 (A: {pa or '缺'}, B: {pb or '缺'})",
-                        "error": True
-                    }
-                else:
-                    res = client.compare_images(
-                        img_path_a=pa,
-                        img_path_b=pb,
-                        task_a=pair.get("task_a", ""),
-                        task_b=pair.get("task_b", ""),
-                        custom_prompt=prompt,
-                        mask_watermark=do_mask,
-                        mask_height_pct=0.20
-                    )
-
-                record = {**pair, **res, "check_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-                self.results_p1.append(record)
-                self.msg_queue.put(("item_p1_done", (idx + 1, total, record)))
-
-            self.msg_queue.put(("all_p1_done", None))
-
-        threading.Thread(target=_worker, daemon=True).start()
+    def _retry_failed_p1(self):
+        """手动补偿：只重跑上一轮仍失败的条目。"""
+        failed_ids = {
+            r.get("id") for r in self.results_p1
+            if r.get("error") and str(r.get("call_status", "")) != "photo_missing"
+        }
+        if not failed_ids:
+            messagebox.showinfo("提示", "没有需要重跑的失败项（照片缺失类重跑也无效，请先补齐照片）。")
+            return
+        pairs = [p for p in self.sampled_pairs if p.get("id") in failed_ids]
+        self._launch_run_p1(pairs, resume=True)
 
     def _export_p1(self):
         if not self.results_p1:
@@ -762,10 +935,10 @@ class PhotoCheckerApp(ctk.CTk):
 
         dir_name = os.path.dirname(self.excel_path_p1)
         base_name = os.path.splitext(os.path.basename(self.excel_path_p1))[0]
-        suggested_out = os.path.join(dir_name, f"{base_name}_追加AI多维质检结果副本.xlsx")
+        suggested_out = os.path.join(dir_name, f"{base_name}_追加结论体系副本.xlsx")
 
         out = filedialog.asksaveasfilename(
-            title="保存带有 AI 多维质检结果的原表副本",
+            title="保存带有结论体系的原表副本",
             initialfile=os.path.basename(suggested_out),
             initialdir=dir_name,
             defaultextension=".xlsx",
@@ -882,48 +1055,59 @@ class PhotoCheckerApp(ctk.CTk):
 
         for it in self.sampled_storefront_items:
             self.tree.insert("", "end", iid=f"p2_{it['id']}", values=(
-                it["id"],
-                it.get("task_id", ""),
-                it.get("photo_name", ""),
-                "等待中",
-                "-",
-                "-",
-                "-"
+                it["id"], it.get("task_id", ""), it.get("photo_name", ""),
+                "等待中", "-", "-", "-", "排队中"
             ))
 
         self.is_running = True
         self.stop_requested = False
+        self.run_started_at = datetime.now()
         self.btn_start_p2.configure(state="disabled")
         self.btn_stop_p2.configure(state="normal")
         self.progress_bar.set(0)
 
         client = self._get_client()
         prompt = self.txt_prompt_p2.get("1.0", "end").strip()
+        cfg = self._get_runner_config("p2", len(self.sampled_storefront_items))
+
+        self.runtime_stats = {"workers": cfg.workers, "retries": 0, "failed": 0, "throttled": 0}
+        self._update_runtime_label(
+            "p2", f"运行状态: 执行中 | 并发 {cfg.workers} | 重试 0 | 失败 0", "#f59e0b"
+        )
+
+        def _task(it: Dict[str, Any]) -> Dict[str, Any]:
+            img_path = it.get("path")
+            if not img_path or not os.path.exists(img_path):
+                return {
+                    "is_real_storefront": None,
+                    "confidence": 0.0,
+                    "store_name": "缺失",
+                    "risk_type": "照片缺失",
+                    "reason": f"未定位到本地图片: {img_path}",
+                    "call_status": "photo_missing",
+                    "error": True
+                }
+            return client.inspect_storefront_image(img_path, custom_prompt=prompt)
+
+        def _on_result(done, total, item, res, meta):
+            record = {
+                **item,
+                **(res or {}),
+                "重试次数": meta.get("retries", 0),
+                "执行阶段": meta.get("phase", "main"),
+            }
+            self.results_p2.append(record)
+            self.msg_queue.put(("item_p2_done", (done, total, record, meta)))
 
         def _worker():
-            total = len(self.sampled_storefront_items)
-            for idx, it in enumerate(self.sampled_storefront_items):
-                if self.stop_requested:
-                    break
-
-                img_path = it.get("path")
-                if not img_path or not os.path.exists(img_path):
-                    res = {
-                        "is_real_storefront": False,
-                        "confidence": 0.0,
-                        "store_name": "缺失",
-                        "risk_type": "照片缺失",
-                        "reason": f"未定位到本地图片: {img_path}",
-                        "error": True
-                    }
-                else:
-                    res = client.inspect_storefront_image(img_path, custom_prompt=prompt)
-
-                record = {**it, **res}
-                self.results_p2.append(record)
-                self.msg_queue.put(("item_p2_done", (idx + 1, total, record)))
-
-            self.msg_queue.put(("all_p2_done", None))
+            runner = ConcurrentRunner(
+                config=cfg,
+                on_result=_on_result,
+                on_event=lambda e: self.msg_queue.put(("runner_event", e)),
+                should_stop=lambda: self.stop_requested,
+            )
+            summary = runner.run(self.sampled_storefront_items, _task)
+            self.msg_queue.put(("all_p2_done", summary))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -942,7 +1126,30 @@ class PhotoCheckerApp(ctk.CTk):
 
     def _stop_running(self):
         self.stop_requested = True
-        self.lbl_progress.configure(text="正在终止...")
+        self.lbl_progress.configure(text="正在终止（等待已发出的请求回收）...")
+
+    # ================== 运行报告 ==================
+
+    def _format_summary(self, summary: Dict[str, Any]) -> str:
+        total = summary.get("total", 0)
+        ok = summary.get("succeeded", 0)
+        failed = summary.get("failed", 0)
+        elapsed = summary.get("elapsed_sec", 0.0) or 0.0
+        speed = (ok / elapsed) if elapsed > 0 else 0.0
+        lines = [
+            f"总条数: {total}",
+            f"成功: {ok} | 失败: {failed}",
+            f"发生重试的条目: {summary.get('retried_items', 0)} （累计重试 {summary.get('total_retries', 0)} 次）",
+            f"补偿轮: 重跑 {summary.get('compensated', 0)} 条，救回 {summary.get('compensated_ok', 0)} 条",
+            f"限流降速事件: {summary.get('throttle_events', 0)} 次",
+            f"并发: 起始 {summary.get('start_workers', 0)} → 结束 {summary.get('final_workers', 0)}",
+            f"耗时: {elapsed:.1f} 秒，平均 {speed:.2f} 条/秒",
+        ]
+        if summary.get("stopped"):
+            lines.append("注意：本次运行被手动终止，未完成部分可再次点击开始或重跑失败项。")
+        if failed:
+            lines.append("失败条目已保留在列表中（红色），可点击【🔁 重跑失败项】补偿；已成功的结果有缓存，不会重复计费。")
+        return "\n".join(lines)
 
     # ================== 消息循环处理 ==================
 
@@ -967,44 +1174,73 @@ class PhotoCheckerApp(ctk.CTk):
                     cnt = len(self.photo_indexer_p1.by_filename)
                     messagebox.showinfo("索引完成", f"已成功索引 {cnt} 张照片文件！")
 
+                elif m_type == "runner_event":
+                    self._handle_runner_event(data)
+
                 elif m_type == "item_p1_done":
-                    cur, total, rec = data
+                    cur, total, rec, meta = data
                     iid = f"p1_{rec['id']}"
 
                     verdict_s = rec.get("verdict", "完成")
-                    is_same_s = "是" if rec.get("is_same_photo", rec.get("is_same")) else "否"
+                    same_val = rec.get("is_same_photo", rec.get("is_same"))
+                    is_same_s = "-" if same_val is None else ("是" if same_val else "否")
                     sign_1_s = str(rec.get("signboard_text_1", "-"))[:15]
                     sign_2_s = str(rec.get("signboard_text_2", "-"))[:15]
                     match_s = rec.get("signboard_match", "-")
                     sim_s = f"{rec.get('scene_similarity', 0.0):.2f}"
 
+                    retries = meta.get("retries", 0)
+                    if not meta.get("ok"):
+                        run_s = f"失败({meta.get('status', '')})"[:14]
+                        tag = "row_failed"
+                    elif retries > 0:
+                        run_s = f"重试{retries}次后成功"
+                        tag = "row_retried"
+                    else:
+                        run_s = "成功"
+                        tag = ""
+
                     if self.tree.exists(iid):
                         self.tree.item(iid, values=(
                             rec["id"], rec.get("group", ""), rec.get("task_a", ""), rec.get("task_b", ""),
-                            verdict_s, is_same_s, sign_1_s, sign_2_s, match_s, sim_s
-                        ))
+                            verdict_s, is_same_s, sign_1_s, sign_2_s, match_s, sim_s, run_s
+                        ), tags=((tag,) if tag else ()))
                         self.tree.see(iid)
 
-                    self.progress_bar.set(cur / total)
-                    self.lbl_progress.configure(text=f"多维抽检进度: {cur}/{total} ({verdict_s[:8]})")
+                    self.progress_bar.set(cur / max(1, total))
+                    self.lbl_progress.configure(text=f"并发抽检进度: {cur}/{total}")
+
+                    if not meta.get("ok"):
+                        self.runtime_stats["failed"] += 1
+                    self.runtime_stats["retries"] += retries
+                    self.runtime_stats["workers"] = meta.get("workers_now", self.runtime_stats["workers"])
+                    self._refresh_runner_state("p1")
 
                     same_n = sum(1 for r in self.results_p1 if r.get("is_same_photo", r.get("is_same")))
-                    diff_n = len(self.results_p1) - same_n
+                    other_n = len(self.results_p1) - same_n
                     self.lbl_summary_stats.configure(
-                        text=f"已检: {len(self.results_p1)} | 同一照片(违规): {same_n} | 正常/误判: {diff_n}"
+                        text=f"已检: {len(self.results_p1)} | AI建议同一底片: {same_n} | 其他: {other_n}"
                     )
 
                 elif m_type == "all_p1_done":
+                    summary = data or {}
                     self.is_running = False
                     self.btn_start_p1.configure(state="normal")
                     self.btn_stop_p1.configure(state="disabled")
-                    self.lbl_progress.configure(text="多维证据链对比抽检完成！")
-                    messagebox.showinfo("完成", f"全部 {len(self.results_p1)} 组抽检完毕！可点击【📋 生成原表追加副本】将多维结果回填原表！")
+                    has_failed = bool(summary.get("failed", 0))
+                    self.btn_retry_failed_p1.configure(state="normal" if has_failed else "disabled")
+                    self.lbl_progress.configure(text="本轮并发抽检结束")
+                    self._update_runtime_label(
+                        "p1",
+                        f"运行状态: 完成 | 并发 {summary.get('final_workers', '-')} | 重试 {summary.get('total_retries', 0)} | 失败 {summary.get('failed', 0)}",
+                        "#34d399" if not has_failed else "#ef4444"
+                    )
+                    messagebox.showinfo("运行报告", self._format_summary(summary))
 
                 elif m_type == "copy_p1_done":
                     out_path = data
                     self.lbl_progress.configure(text="原表追加副本生成成功！")
-                    messagebox.showinfo("生成原表副本成功", f"已成功在原表数据右侧追加多维质检结果与店招字段，并保存为副本文件:\n\n{out_path}")
+                    messagebox.showinfo("生成原表副本成功", f"已在原表右侧追加结论体系与审计字段，并保存为副本文件:\n\n{out_path}")
 
                 elif m_type == "copy_p1_error":
                     err_msg = data
@@ -1028,58 +1264,115 @@ class PhotoCheckerApp(ctk.CTk):
                     conf = res.get("confidence", 0.0)
                     reason = res.get("reason", "")
 
-                    verdict_str = f"【单图测试】真实门头: {'✅ 是' if is_real else '❌ 否'} | 风险: {risk} | 店名: {store} (置信度: {conf:.2f})"
+                    verdict_str = f"【单图测试】AI建议真实门头: {'✅ 是' if is_real else '❌ 否'} | 风险: {risk} | 店名: {store} (置信度仅参考: {conf:.2f})"
                     self.lbl_verdict.configure(text=verdict_str, text_color="#10b981" if is_real else "#ef4444")
-                    self.lbl_multi_metrics.configure(text=f"【门头指标】 店名: {store} | 风险类别: {risk} | 置信度: {conf:.2f}")
+                    self.lbl_multi_metrics.configure(text=f"【门头指标】 店名: {store} | 风险类别: {risk} | 置信度(仅参考): {conf:.2f}")
 
                     self.txt_reason.configure(state="normal")
                     self.txt_reason.delete("1.0", "end")
                     detail_text = f"【单图即时验证报告】:\n\n"
-                    detail_text += f"● 是否为真实门头照: {'真实门头' if is_real else '非真实门头 / 违规'}\n"
+                    detail_text += f"● AI 建议是否真实门头照: {'真实门头' if is_real else '非真实门头 / 待核实'}\n"
                     detail_text += f"● 风险类型分类: {risk}\n"
                     detail_text += f"● 识别门头招牌: {store}\n"
-                    detail_text += f"● AI置信度: {conf:.2f}\n"
+                    detail_text += f"● AI置信度(仅参考): {conf:.2f}\n"
                     detail_text += f"● 详细判定依据:\n{reason}\n\n"
                     detail_text += f"测试照片绝对路径: {img_p}"
                     self.txt_reason.insert("1.0", detail_text)
                     self.txt_reason.configure(state="disabled")
 
                 elif m_type == "item_p2_done":
-                    cur, total, rec = data
+                    cur, total, rec, meta = data
                     iid = f"p2_{rec['id']}"
-                    is_real_s = "真实" if rec.get("is_real_storefront") else "非真实"
-                    if rec.get("error"):
-                        is_real_s = "异常"
+                    real_val = rec.get("is_real_storefront")
+                    is_real_s = "异常" if rec.get("error") else ("真实" if real_val else "待核实")
                     risk_s = rec.get("risk_type", "-")
                     store_s = rec.get("store_name", "-")
                     conf_s = f"{rec.get('confidence', 0.0):.2f}"
 
+                    retries = meta.get("retries", 0)
+                    if not meta.get("ok"):
+                        run_s = f"失败({meta.get('status', '')})"[:14]
+                        tag = "row_failed"
+                    elif retries > 0:
+                        run_s = f"重试{retries}次后成功"
+                        tag = "row_retried"
+                    else:
+                        run_s = "成功"
+                        tag = ""
+
                     if self.tree.exists(iid):
                         self.tree.item(iid, values=(
                             rec["id"], rec.get("task_id", ""), rec.get("photo_name", ""),
-                            is_real_s, risk_s, store_s, conf_s
-                        ))
+                            is_real_s, risk_s, store_s, conf_s, run_s
+                        ), tags=((tag,) if tag else ()))
                         self.tree.see(iid)
 
-                    self.progress_bar.set(cur / total)
-                    self.lbl_progress.configure(text=f"质检进度: {cur}/{total}")
+                    self.progress_bar.set(cur / max(1, total))
+                    self.lbl_progress.configure(text=f"并发质检进度: {cur}/{total}")
+
+                    if not meta.get("ok"):
+                        self.runtime_stats["failed"] += 1
+                    self.runtime_stats["retries"] += retries
+                    self.runtime_stats["workers"] = meta.get("workers_now", self.runtime_stats["workers"])
+                    self._refresh_runner_state("p2")
 
                     real_n = sum(1 for r in self.results_p2 if r.get("is_real_storefront"))
-                    fake_n = len(self.results_p2) - real_n
+                    other_n = len(self.results_p2) - real_n
                     self.lbl_summary_stats.configure(
-                        text=f"已质检: {len(self.results_p2)} | 真实门头: {real_n} | 异常/非门头: {fake_n}"
+                        text=f"已质检: {len(self.results_p2)} | AI建议真实: {real_n} | 待核实/异常: {other_n}"
                     )
 
                 elif m_type == "all_p2_done":
+                    summary = data or {}
                     self.is_running = False
                     self.btn_start_p2.configure(state="normal")
                     self.btn_stop_p2.configure(state="disabled")
-                    self.lbl_progress.configure(text="门头照质检完成！")
-                    messagebox.showinfo("质检完成", f"全部 {len(self.results_p2)} 张门头照质检完毕，可导出 Excel 质检报表！")
+                    self.lbl_progress.configure(text="门头照并发质检结束")
+                    self._update_runtime_label(
+                        "p2",
+                        f"运行状态: 完成 | 并发 {summary.get('final_workers', '-')} | 重试 {summary.get('total_retries', 0)} | 失败 {summary.get('failed', 0)}",
+                        "#34d399" if not summary.get("failed") else "#ef4444"
+                    )
+                    messagebox.showinfo("运行报告", self._format_summary(summary))
 
         except queue.Empty:
             pass
         self.after(100, self._process_queue)
+
+    def _handle_runner_event(self, event: Dict[str, Any]):
+        etype = event.get("type")
+        prefix = "p1" if self.current_mode == "相同照片比对核验" else "p2"
+
+        if etype == "throttled":
+            self.runtime_stats["throttled"] += 1
+            self.runtime_stats["workers"] = event.get("workers", self.runtime_stats["workers"])
+            self.lbl_progress.configure(
+                text=f"检测到限流/服务端压力，已自动降并发至 {event.get('workers')}"
+            )
+            self._refresh_runner_state(prefix)
+
+        elif etype == "retry":
+            self.lbl_progress.configure(
+                text=f"第 {event.get('index')} 条重试中 ({event.get('attempt')}/{event.get('max_attempts')})：{event.get('status', '')}"
+            )
+
+        elif etype == "compensation_start":
+            self.lbl_progress.configure(
+                text=f"进入补偿轮：{event.get('count')} 条失败项将以 {event.get('workers')} 并发重跑"
+            )
+            self._update_runtime_label(prefix, f"运行状态: 补偿轮 | 并发 {event.get('workers')} ", "#f59e0b")
+
+    def _refresh_runner_state(self, prefix: str):
+        s = self.runtime_stats
+        text = f"并发: {s.get('workers', '-')} | 重试: {s.get('retries', 0)} | 失败: {s.get('failed', 0)}"
+        if s.get("throttled"):
+            text += f" | 降速: {s['throttled']}次"
+        self.lbl_runner_state.configure(text=text)
+        self._update_runtime_label(
+            prefix,
+            f"运行状态: 执行中 | 当前并发 {s.get('workers', '-')} | 重试 {s.get('retries', 0)} | 失败 {s.get('failed', 0)}",
+            "#f59e0b"
+        )
 
     def _on_tree_select(self, event):
         sel = self.tree.selection()
@@ -1110,84 +1403,7 @@ class PhotoCheckerApp(ctk.CTk):
             reason = rec.get("reason", "等待开始抽检...")
 
             color = "#ef4444" if is_same else "#10b981"
-            self.lbl_verdict.configure(text=f"AI 定性结论: {verdict} (置信度: {conf:.2f})", text_color=color)
+            self.lbl_verdict.configure(text=f"AI 建议结论: {verdict} (置信度仅参考: {conf:.2f})", text_color=color)
 
             # 多维结构化看板更新
-            s1 = rec.get("signboard_text_1", "无店招")
-            s2 = rec.get("signboard_text_2", "无店招")
-            mask_tip = "已物理覆盖" if self.var_mask_watermark.get() else "未开启遮蔽"
-            metrics_txt = f"【多维证据指标】 🏷️ 店招1: [{s1}] | 店招2: [{s2}] | 匹配: {sign_match} | 场景重合: {sim_score:.2f} | 水印: {mask_tip}"
-            self.lbl_multi_metrics.configure(text=metrics_txt)
-
-            self.txt_reason.configure(state="normal")
-            self.txt_reason.delete("1.0", "end")
-            text = f"【AI 多维证据链详细裁决依据】:\n{reason}\n\n"
-            text += f"● 图1任务编号: {rec.get('task_a')} | 路径: {pa or '未找到'}\n"
-            text += f"● 图2任务编号: {rec.get('task_b')} | 路径: {pb or '未找到'}"
-            self.txt_reason.insert("1.0", text)
-            self.txt_reason.configure(state="disabled")
-
-        else:
-            item_id = int(iid.replace("p2_", ""))
-            rec = next((r for r in self.results_p2 if r.get("id") == item_id), None)
-            if not rec:
-                rec = next((r for r in self.sampled_storefront_items if r.get("id") == item_id), None)
-            if not rec:
-                return
-
-            p = rec.get("path")
-            self.current_preview_paths = (p, None)
-            self.btn_open_native.configure(state="normal" if p else "disabled")
-
-            self._render_thumbnail(p, self.lbl_img_a, self.lbl_t_a, f"门头照: {rec.get('photo_name', '')}")
-
-            is_real = rec.get("is_real_storefront")
-            risk = rec.get("risk_type", "待检验")
-            store = rec.get("store_name", "-")
-            conf = rec.get("confidence", 0.0)
-            reason = rec.get("reason", "等待开始质检...")
-
-            color = "#10b981" if is_real else "#ef4444"
-            self.lbl_verdict.configure(text=f"门头判定: {'真实门头' if is_real else '非真实门头/违规'} | 风险: {risk} | 店名: {store}", text_color=color)
-            self.lbl_multi_metrics.configure(text=f"【门头指标】 店名: {store} | 风险类别: {risk} | 置信度: {conf:.2f}")
-
-            self.txt_reason.configure(state="normal")
-            self.txt_reason.delete("1.0", "end")
-            text = f"【门头照质检结果详情】:\n"
-            text += f"● 是否真实商户门头: {'真实门头' if is_real else '非真实门头 / 违规'}\n"
-            text += f"● 风险类型: {risk}\n"
-            text += f"● 识别招牌店名: {store}\n"
-            text += f"● 置信度: {conf:.2f}\n"
-            text += f"● AI详细判定理由:\n{reason}\n\n"
-            text += f"图片绝对路径: {p or '未找到'}"
-            self.txt_reason.insert("1.0", text)
-            self.txt_reason.configure(state="disabled")
-
-    def _render_thumbnail(self, img_path: Optional[str], target_lbl: ctk.CTkLabel, title_lbl: ctk.CTkLabel, title_text: str):
-        title_lbl.configure(text=title_text[:30] + ("..." if len(title_text) > 30 else ""))
-        if not img_path or not os.path.exists(img_path):
-            target_lbl.configure(image=None, text="未找到图片文件")
-            return
-        try:
-            pil_img = Image.open(img_path)
-            max_w = 540 if self.current_mode != "相同照片比对核验" else 260
-            pil_img.thumbnail((max_w, 240), Image.Resampling.LANCZOS)
-            ctk_img = ctk.CTkImage(light_image=pil_img, dark_image=pil_img, size=pil_img.size)
-            target_lbl.configure(image=ctk_img, text="")
-        except Exception as e:
-            target_lbl.configure(image=None, text=f"加载失败: {str(e)}")
-
-    def _open_native_photos(self):
-        pa, pb = self.current_preview_paths
-        for p in (pa, pb):
-            if p and os.path.exists(p):
-                if sys.platform == "darwin":
-                    os.system(f'open "{p}"')
-                elif sys.platform.startswith("win"):
-                    os.system(f'start "" "{p}"')
-                else:
-                    os.system(f'xdg-open "{p}"')
-
-if __name__ == "__main__":
-    app = PhotoCheckerApp()
-    app.mainloop()
+            s1 = rec.get
