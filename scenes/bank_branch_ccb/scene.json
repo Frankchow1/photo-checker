@@ -1,0 +1,141 @@
+{
+  "scene_id": "bank_branch_ccb",
+  "name": "建行网点识别",
+  "version": "1.0.0",
+  "input_type": "single_image",
+  "description": "识别门头照中是否为中国建设银行网点。AI 只报客观事实，结论由下方 rules 计算。换品牌只需改 variables 与 rules 中的字面值。",
+
+  "prompt_ref": "bank_branch_ccb@production",
+
+  "variables": {
+    "brand_name": "中国建设银行",
+    "brand_aliases": ["中国建设银行", "建设银行", "建行", "CCB"],
+    "brand_color": "蓝",
+    "competitors": ["中国银行", "工商银行", "农业银行", "交通银行", "邮储银行", "招商银行"]
+  },
+
+  "cascade": [
+    {
+      "layer": "L1_ocr",
+      "enabled": false,
+      "_说明": "接入 OCR 后改为 true。开启后只有命中关键词的照片才会花钱调用大模型。",
+      "keywords_any": ["建设银行", "建行", "ccb", "银行", "支行", "储蓄所", "自助银行"],
+      "audit_sample_rate": 0.005,
+      "on_miss": {
+        "problem_type": "非目标品牌",
+        "conclusion_level": "正常",
+        "evidence": "OCR 未读到任何银行相关文字，未进入大模型（按 audit_sample_rate 抽样复核）"
+      }
+    },
+    { "layer": "L2_vlm", "enabled": true },
+    { "layer": "L3_manual", "enabled": true, "review_levels": ["确认", "高度疑似", "待核实"] }
+  ],
+
+  "output_schema": [
+    { "name": "signboard_text", "type": "text", "required": true, "label": "招牌文字" },
+    { "name": "has_logo", "type": "boolean", "required": false, "label": "是否有logo" },
+    { "name": "logo_shape", "type": "text", "required": false, "label": "logo形状" },
+    { "name": "logo_main_color", "type": "enum", "required": false, "label": "logo主色",
+      "enum": ["蓝", "红", "绿", "黄", "白", "黑", "其他", "无法判断"] },
+    { "name": "facade_main_color", "type": "enum", "required": false, "label": "门头主色调",
+      "enum": ["蓝", "红", "绿", "黄", "白", "黑", "其他", "无法判断"] },
+    { "name": "venue_type", "type": "enum", "required": true, "label": "场所类型",
+      "enum": ["银行网点", "ATM自助区", "写字楼", "普通商铺", "广告牌", "无法判断"] },
+    { "name": "has_branch_suffix", "type": "boolean", "required": false, "label": "含机构后缀词" },
+    { "name": "visible_scope", "type": "enum", "required": true, "label": "可见范围",
+      "enum": ["完整门头", "局部", "仅招牌", "仅室内", "无法判断"] },
+    { "name": "text_confidence", "type": "enum", "required": true, "label": "文字转写置信度",
+      "enum": ["高", "中", "低"] },
+    { "name": "other_visible_brands", "type": "text", "required": false, "label": "其他可见品牌" }
+  ],
+
+  "rules": [
+    {
+      "id": "competitor_bank",
+      "_说明": "招牌是同业银行且不含建行字样 -> 直接排除，避免蓝色logo造成混淆",
+      "when": { "all": [
+        { "field": "signboard_text", "op": "contains_any", "value": ["中国银行", "工商银行", "农业银行", "交通银行", "邮储银行", "招商银行", "兴业银行", "浦发银行"] },
+        { "field": "signboard_text", "op": "not_contains_any", "value": ["建设银行", "建行", "ccb"] }
+      ] },
+      "then": { "problem_type": "非目标品牌", "conclusion_level": "正常", "evidence": "招牌文字为其他银行，且未出现建行字样" }
+    },
+    {
+      "id": "ccb_atm_or_ad",
+      "_说明": "有建行字样但场所是ATM或广告牌 -> 关联但非网点，单独一类，不混入网点",
+      "when": { "all": [
+        { "field": "signboard_text", "op": "contains_any", "value": ["中国建设银行", "建设银行", "建行", "ccb"] },
+        { "field": "venue_type", "op": "in", "value": ["atm自助区", "广告牌"] }
+      ] },
+      "then": { "problem_type": "关联但非网点", "conclusion_level": "正常", "evidence": "出现建行字样，但场所为ATM自助区或广告牌，非网点门头" }
+    },
+    {
+      "id": "ccb_confirmed",
+      "_说明": "文字+（logo主色或场所类型）双条件成立 -> 确认",
+      "when": { "all": [
+        { "field": "signboard_text", "op": "contains_any", "value": ["中国建设银行", "建设银行"] },
+        { "field": "text_confidence", "op": "in", "value": ["高", "中"] },
+        { "any": [
+          { "field": "logo_main_color", "op": "equals", "value": "蓝" },
+          { "field": "venue_type", "op": "equals", "value": "银行网点" }
+        ] }
+      ] },
+      "then": { "problem_type": "建行网点", "conclusion_level": "确认", "evidence": "招牌文字命中建行，且 logo 主色为蓝或场所类型为银行网点" }
+    },
+    {
+      "id": "low_confidence_or_partial",
+      "_说明": "信息不足兵守：放在确认之后、疑似之前，确保铁证不被降级、模糊件不被硬判",
+      "when": { "any": [
+        { "field": "text_confidence", "op": "equals", "value": "低" },
+        { "field": "visible_scope", "op": "in", "value": ["局部", "仅室内", "无法判断"] }
+      ] },
+      "then": { "problem_type": "信息不足", "conclusion_level": "待核实", "evidence": "文字转写置信度低或画面不完整，不做硬判，转人工" }
+    },
+    {
+      "id": "ccb_text_only",
+      "when": { "field": "signboard_text", "op": "contains_any", "value": ["中国建设银行", "建设银行", "建行", "ccb"] },
+      "then": { "problem_type": "建行网点", "conclusion_level": "高度疑似", "evidence": "仅招牌文字命中，logo 与场所类型未同时支持" }
+    },
+    {
+      "id": "visual_only",
+      "_说明": "文字没读到，但蓝色logo+银行网点形态 -> 疑似，请人工看",
+      "when": { "all": [
+        { "field": "has_logo", "op": "is_true" },
+        { "field": "logo_main_color", "op": "equals", "value": "蓝" },
+        { "field": "venue_type", "op": "equals", "value": "银行网点" }
+      ] },
+      "then": { "problem_type": "待确认银行", "conclusion_level": "高度疑似", "evidence": "未读到品牌文字，但为蓝色 logo 的银行网点形态，需人工区分同业" }
+    }
+  ],
+
+  "fallback": {
+    "problem_type": "非目标品牌",
+    "conclusion_level": "正常",
+    "evidence": "未发现任何建行特征"
+  },
+
+  "columns": [
+    { "key": "conclusion_level", "header": "结论等级", "width": 90 },
+    { "key": "problem_type", "header": "问题类型", "width": 120 },
+    { "key": "obs.signboard_text", "header": "招牌文字", "width": 220 },
+    { "key": "obs.venue_type", "header": "场所类型", "width": 100 },
+    { "key": "obs.logo_main_color", "header": "logo主色", "width": 80 },
+    { "key": "obs.visible_scope", "header": "可见范围", "width": 90 },
+    { "key": "evidence", "header": "结论依据", "width": 260 },
+    { "key": "cascade_stage", "header": "判定层", "width": 70 },
+    { "key": "run_status", "header": "执行状态", "width": 110 }
+  ],
+
+  "defaults": {
+    "workers": 6,
+    "max_retries": 3,
+    "mask_watermark": true,
+    "sample_mode": "全量"
+  },
+
+  "samples": {
+    "positive": "samples/positive",
+    "hard_negative": "samples/hard_negative",
+    "golden_set": "samples/golden",
+    "_说明": "难负例必须包含：中国银行等同业、建行ATM自助区、贴建行贴纸的普通商铺、建行广告牌。无 golden 目录时 UI 会标注「未验证」。"
+  }
+}
